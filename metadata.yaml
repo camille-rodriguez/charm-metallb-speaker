@@ -15,4 +15,4 @@ tags:
   - kubernetes
   - metallb
 deployment:
-  type: deamonset
+  type: daemon

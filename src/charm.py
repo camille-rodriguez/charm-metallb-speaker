@@ -2,16 +2,21 @@
 # Copyright 2020 Camille Rodriguez
 # See LICENSE file for licensing details.
 
+from base64 import b64encode
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-import os
 import logging
+import os
+import random
+import string
+
 
 from ops.charm import CharmBase
 from ops.main import main
 from ops.framework import StoredState
 from ops.model import (
     ActiveStatus,
+    BlockedStatus,
     MaintenanceStatus,
 )
 
@@ -22,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 class MetallbSpeakerCharm(CharmBase):
     _stored = StoredState()
+
+    NAMESPACE = os.environ["JUJU_MODEL_NAME"]
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -41,7 +48,7 @@ class MetallbSpeakerCharm(CharmBase):
 
         logging.info('Setting the pod spec')
         self.framework.model.unit.status = MaintenanceStatus("Configuring pod")
-        iprange = self.model.config["iprange"]
+        secret = self._random_secret(128)
 
         self.framework.model.pod.set_spec(
             {
@@ -72,13 +79,46 @@ class MetallbSpeakerCharm(CharmBase):
                 },
                 'containers': [{
                     'name': 'speaker',
-                    'image': 'metallb/controller:v0.9.3',
+                    'image': 'metallb/speaker:v0.9.3',
                     'imagePullPolicy': 'Always',
                     'ports': [{
                         'containerPort': 7472,
                         'protocol': 'TCP',
                         'name': 'monitoring'
                     }],
+                    'envConfig': {
+                        'METALLB_NODE_NAME': {
+                            'field': {
+                                'path': 'spec.nodeName',
+                                'api-version': 'v1'
+                            }
+                        },
+                        'METALLB_HOST': {
+                            'field': {
+                                'path': 'status.hostIP',
+                                'api-version': 'v1'
+                            }
+                        },
+                        'METALLB_ML_BIND_ADDR': {
+                            'field': {
+                                'path': 'status.podIP',
+                                'api-version': 'v1'
+                            }
+                        },
+                        'METALLB_ML_LABELS': "app=metallb,component=speaker",
+                        'METALLB_ML_NAMESPACE': {
+                            'field': {
+                                'path': 'metadata.namespace',
+                                'api-version': 'v1'
+                            }
+                        },
+                        'METALLB_ML_SECRET_KEY': {
+                            'secret': {
+                                'name': 'memberlist',
+                                'key': 'secretkey'
+                            }
+                        }
+                    },
                     # constraint fields do not exist in pod_spec
                     # bug : https://bugs.launchpad.net/juju/+bug/1893123
                     # 'cpu': 100,
@@ -91,34 +131,40 @@ class MetallbSpeakerCharm(CharmBase):
                     # },
                     'kubernetes': {
                         'securityContext': {
-                            'privileged': False,
-                            'runAsNonRoot': True,
-                            'runAsUser': 65534,
+                            'allowPrivilegeEscalation': False,
                             'readOnlyRootFilesystem': True,
+                            'capabilities': {
+                                'add': ['NET_ADMIN', 'NET_RAW', 'SYS_ADMIN'],
+                                'drop': ['ALL']
                             },
+
+                        },
                         # fields do not exist in pod_spec
-                        # 'TerminationGracePeriodSeconds': 0, 
-                        # 'capabilities': {
-                        #     'drop': ['all']
-                        # }
+                        # 'TerminationGracePeriodSeconds': 2, 
                     },
                 }],
+                'kubernetesResources': {
+                    'secrets': [
+                            {
+                                'name': 'memberlist',
+                                'type': 'Opaque',
+                                'data': {
+                                    'secretkey': b64encode(secret.encode('utf-8')).decode('utf-8')
+                                }
+                            }
+                        ]
+                },
                 'service': {
                     'annotations': {
                         'prometheus.io/port': '7472',
                         'prometheus.io/scrape': 'true'
                     }
                 },
-                'configMaps': {
-                    'config': {
-                        'config' : 'address-pools:\n- name: default\n  protocol: layer2\n  addresses:\n  - ' + iprange
-                    }
-                }
             },
         )
 
-        logging.info('launching create_pod_spec_with_k8s_api')
-        self.create_pod_spec_with_k8s_api()
+        logging.info('launching create_pod_security_policy_with_k8s_api')
+        self.create_pod_security_policy_with_k8s_api()
         self.create_namespaced_role_with_api(
             name='config-watcher',
             labels={'app': 'metallb'},
@@ -132,8 +178,16 @@ class MetallbSpeakerCharm(CharmBase):
             verbs=['list']
         )
         logging.info('Launching bind_role_with_api')
-        self.bind_role_with_api(name='config-watcher', labels={'app': 'metallb'}, subject_name='speaker')
-        self.bind_role_with_api(name='pod-lister', labels={'app': 'metallb'}, subject_name='speaker')
+        self.bind_role_with_api(
+            name='config-watcher', 
+            labels={'app': 'metallb'}, 
+            subject_name='speaker'
+        )
+        self.bind_role_with_api(
+            name='pod-lister', 
+            labels={'app': 'metallb'}, 
+            subject_name='speaker'
+        )
         self.framework.model.unit.status = ActiveStatus("Ready")
 
     def create_pod_security_policy_with_k8s_api(self):
@@ -159,10 +213,10 @@ class MetallbSpeakerCharm(CharmBase):
             host_ipc = False,
             host_network = True,
             host_pid = False,
-            host_ports = client.ExtensionsV1beta1HostPortRange(
+            host_ports = [client.PolicyV1beta1HostPortRange(
                 max = 7472,
                 min = 7472,
-            ),
+            )],
             privileged = True,
             read_only_root_filesystem = True,
             required_drop_capabilities = ['ALL'],
@@ -184,10 +238,15 @@ class MetallbSpeakerCharm(CharmBase):
             api_instance = client.PolicyV1beta1Api(api_client)
             try:
                 api_instance.create_pod_security_policy(body, pretty=True)
-            except ApiException:
+            except ApiException as err:
                 logging.exception("Exception when calling PolicyV1beta1Api->create_pod_security_policy.")
+                if err.status != 409:
+                    # ignoring 409 (AlreadyExists) errors
+                    self.framework.model.unit.status = \
+                        BlockedStatus("An error occured during instantiation. Please check the logs.")
 
-    def create_namespaced_role_with_api(self, name, namespace=self.NAMESPACE, labels, api_groups=[''],  resources, verbs):
+
+    def create_namespaced_role_with_api(self, name, labels, resources, verbs, api_groups=['']):
         # Using API because of bug https://github.com/canonical/operator/issues/390
         self._load_kube_config()
 
@@ -196,7 +255,7 @@ class MetallbSpeakerCharm(CharmBase):
             body = client.V1Role(
                 metadata = client.V1ObjectMeta(
                     name = name,
-                    namespace = namespace,
+                    namespace = self.NAMESPACE,
                     labels = labels
                 ),
                 rules = [client.V1PolicyRule(
@@ -207,10 +266,14 @@ class MetallbSpeakerCharm(CharmBase):
             )
             try:
                 api_instance.create_namespaced_role(self.NAMESPACE, body, pretty=True)
-            except ApiException:
+            except ApiException as err:
                 logging.exception("Exception when calling RbacAuthorizationV1Api->create_namespaced_role.")
+                if err.status != 409:
+                    # ignoring 409 (AlreadyExists) errors
+                    self.framework.model.unit.status = \
+                        BlockedStatus("An error occured during instantiation. Please check the logs.")
 
-    def bind_role_with_api(self, name, namespace=self.NAMESPACE, labels, subject_kind='ServiceAccount', subject_name):
+    def bind_role_with_api(self, name, labels, subject_name, subject_kind='ServiceAccount'):
         # Using API because of bug https://github.com/canonical/operator/issues/390
         self._load_kube_config()
 
@@ -236,9 +299,17 @@ class MetallbSpeakerCharm(CharmBase):
             )
             try:
                 api_instance.create_namespaced_role_binding(self.NAMESPACE, body, pretty=True)
-            except ApiException:
+            except ApiException as err:
                 logging.exception("Exception when calling RbacAuthorizationV1Api->create_namespaced_role_binding.")
+                if err.status != 409:
+                    # ignoring 409 (AlreadyExists) errors
+                    self.framework.model.unit.status = \
+                        BlockedStatus("An error occured during instantiation. Please check the logs.")
 
+    def _random_secret(self, length):
+        letters = string.ascii_letters
+        result_str = ''.join(random.choice(letters) for i in range(length))
+        return result_str
 
     def _load_kube_config(self):
         # TODO: Remove this workaround when bug LP:1892255 is fixed
