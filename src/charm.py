@@ -118,8 +118,6 @@ class MetallbSpeakerCharm(CharmBase):
                     },
                     # TODO: add constraint fields once it exists in pod_spec
                     # bug : https://bugs.launchpad.net/juju/+bug/1893123
-                    # 'cpu': 100,
-                    # 'memory': 100,
                     # 'resources': {
                     #     'limits': {
                     #         'cpu': '100m',
